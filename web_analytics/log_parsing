@@ -1,26 +1,62 @@
 #!/usr/local/bin/python
 
+import configparser
 import csv
 import re
 import sys
-import urlparse
-
+import urllib.parse
+from collections import OrderedDict
+from copy import deepcopy
+from datetime import datetime
 from optparse import OptionParser
+
+##################
+# CONFIG HELPERS #
+##################
+
+
+def process_config_list(entry, d=','):
+    """
+    Process a config.ini entry that represntes a list.
+
+    Args:
+        entry: string, config entry.
+        d: delimiter
+
+    Returns:
+        list, where items are stripped of whitespace.
+    """
+    return [e.strip() for e in entry.split(d)]
+
 
 ####################
 # GLOBAL VARIABLES #
 ####################
 
+config = configparser.ConfigParser()
+config.read('config.ini')
+
 # regular expression for parsing Apache log files.
-regex = '^([^ ]+) - [^ ]+ \[(.*?)\] "(.*?)" (\d+) (\d+|-) "(.*?)" "(.*?)"$'
+REGEX = '^([^ ]+) - [^ ]+ \[(.*?)\] "(.*?)" (\d+) (\d+|-) "(.*?)" "(.*?)"$'
+
+DATE_TIME_FORMAT = config.get('MAIN', 'date_time_conversion_format', raw=True)
 
 # if the current URL contains any of the following substrings, skip it.
-skip_urls_containing = ['/vufind/AJAX/', '/vufind/Cart/', '/vufind/Cover/', '/vufind/Feedback/', '/vufind/MyResearch/', '/vufind/Record/',
-                        '/vufind/Search/Advanced', '/vufind/Search/FacetList', '/vufind/Search/OpenSearch', '/vufind/Search/Suggest', '/vufind/themes/']
+skip_urls_containing = [
+    '/vufind/AJAX/', '/vufind/Cart/', '/vufind/Cover/', '/vufind/Feedback/',
+    '/vufind/MyResearch/', '/vufind/Record/', '/vufind/Search/Advanced',
+    '/vufind/Search/FacetList', '/vufind/Search/OpenSearch',
+    '/vufind/Search/Suggest', '/vufind/themes/'
+]
 
 # collect these filters.
-filter_headings = ['-author_facet', 'author_facet', '~author_facet', '-building', 'building', '~building', '-callnumber-first', 'callnumber-first', '~callnumber-first', '-format',
-                   'format', '~format', '-language', 'language', '~language', '-series_facet', 'series_facet', '~series_facet', 'publishDate', '-topic_facet', 'topic_facet', '~topic_facet']
+filter_headings = [
+    '-author_facet', 'author_facet', '~author_facet', '-building', 'building',
+    '~building', '-callnumber-first', 'callnumber-first', '~callnumber-first',
+    '-format', 'format', '~format', '-language', 'language', '~language',
+    '-series_facet', 'series_facet', '~series_facet', 'publishDate',
+    '-topic_facet', 'topic_facet', '~topic_facet'
+]
 
 # collect these miscellaneous parameters.
 miscellaneous_headings = ['limit', 'page', 'sort']
@@ -29,74 +65,187 @@ miscellaneous_headings = ['limit', 'page', 'sort']
 source_headings = ['author', 'journal', 'lcc', 'series', 'title', 'topic']
 
 # collect these types parameters.
-type_headings = ['AllFields', 'Author', 'Donor', 'JournalTitle', 'Notes', 'Performer', 'Publication Place', 'Publisher', 'Series', 'StandardNumbers',
-                 'Subject', 'Title ', 'Title Uniform', 'Subject', 'toc', 'year', 'AuthorBrowse', 'LccBrowse', 'SeriesBrowse', 'TitleBrowse', 'TopicBrowse', 'ids', 'oclc_num']
+type_headings = [
+    'AllFields', 'Author', 'Donor', 'JournalTitle', 'Notes', 'Performer',
+    'Publication Place', 'Publisher', 'Series', 'StandardNumbers', 'Subject',
+    'Title ', 'Title Uniform', 'Subject', 'toc', 'year', 'AuthorBrowse',
+    'LccBrowse', 'SeriesBrowse', 'TitleBrowse', 'TopicBrowse', 'ids',
+    'oclc_num'
+]
 
 # output these headings.
-headers = ['search type'] + type_headings + source_headings + \
-    miscellaneous_headings + filter_headings + ['query string']
+# headers = ['search type'] + type_headings + source_headings + \
+#    miscellaneous_headings + filter_headings + ['query string']
+HEADERS = process_config_list(config['MAIN']['headers'])
 
-# FUNCTION DEFINITIONS
+ALLOWED_HTTP_STATUS_CODES = process_config_list(
+    config['MAIN']['allowed_http_status_code'])
 
-# parse a line of the apache log file.
-# return GETs that returned a 200 only.
-# returns None, or a string (the URL.)
+LIMIT_BY_SECTIONS = process_config_list(config.get('LIMITS', 'sections'))
+
+LIMIT_TO_YEARS = [
+    int(n)
+    for n in process_config_list(config.get('LIMITS', 'years', fallback=[]))
+]
+
+file_date_hitcount = {}
+
+#############################
+# MAIN FUNCTION DEFINITIONS #
+#############################
+
+
+def get_query_string(request_path):
+    """
+    Gets a query string from a request_path if there is one.
+
+    Returns:
+        A query string or an empty string.
+    """
+    query_string = ''
+    query_string = urllib.parse.splitquery(request_path)[1]
+    return query_string
+
+
+def split_filename_from_path(request_path):
+    """
+    Split a filename from the request path if there is one.
+
+    Returns:
+        list of strings, where the first item is the request
+        path - the file name and the second item is a filename.
+    """
+    parts = []
+    parts = request_path.rsplit('/', 1)
+    return parts
+
+
+def in_allowed_sections(request_path):
+    """
+    Test to see if a file is in one of the  sections of the site
+    that we are trying to search.
+
+    Args:
+        request_path: string
+
+    Returns:
+        bool
+    """
+    flag = True
+    if LIMIT_BY_SECTIONS:
+        filename = split_filename_from_path(request_path)[-1]
+        flag = False
+        for path in LIMIT_BY_SECTIONS:
+            full_path = path + filename
+            if full_path == request_path:
+                flag = True
+    return flag
+
+
+def total_hits_to_string(total_hits):
+    """
+    Process total hits for display in a csv file.
+    Turn zeros into empty strings.
+
+    Args:
+        total_hits: int
+
+    Returns:
+        string
+    """
+    if total_hits == 0:
+        return ''
+    else:
+        return str(total_hits)
+
+
+def apache_log_line_to_dict(line):
+    """
+    Parse a line of the apache log file and break it into it's
+    component parts.
+
+    Return a dictionary of data about the line including,
+        ip_address, date_and_time, request_verb (GET),
+        reequest_path, http_status_code, referer, or
+        user_agent.
+    """
+
+    try:
+        log_fields = re.match(REGEX, line).groups()
+    except AttributeError:
+        print(("Error when parsing: " + line))
+        sys.exit()
+
+    parts = {
+        # e.g. 192.5.85.4
+        'ip_address': log_fields[0],
+
+        # e.g. 26/May/2017:18:44:48 -500
+        'date_and_time': log_fields[1],
+
+        # e.g. GET or POST
+        'request_verb': log_fields[2].split(' ')[0],
+
+        # e.g. /bmrc/view.php?eadid=BMRC.SHOREFRONT.BLACKBOARD.SURVEY
+        'request_path': log_fields[2].split(' ')[1],
+
+        # e.g. 200
+        'http_status_code': log_fields[3],
+
+        # url that referred this one, or '-'.
+        'referrer': log_fields[5],
+
+        # e.g. 'gsa-crawler...'
+        'user_agent': log_fields[6],
+    }
+
+    return parts
 
 
 def apache_log_line_to_request_path(line):
-    try:
-        log_fields = re.match(regex, line).groups()
-    except AttributeError:
-        print("Error when parsing: " + line)
-        sys.exit()
+    """
+    Helper function that gets the request_path from a dictionary
+    of data about an apache log line.
 
-    # e.g. 192.5.85.4
-    ip_address = log_fields[0]
-
-    # e.g. 26/May/2017:18:44:48 -500
-    date_and_time = log_fields[1]
-
-    # e.g. GET or POST
-    request_verb = log_fields[2].split(' ')[0]
-
-    # e.g. /bmrc/view.php?eadid=BMRC.SHOREFRONT.BLACKBOARD.SURVEY
-    request_path = log_fields[2].split(' ')[1]
-
-    # e.g. 200
-    http_status_code = log_fields[3]
-
-    # url that referred this one, or '-'.
-    referrer = log_fields[5]
-
-    # e.g. 'gsa-crawler...'
-    user_agent = log_fields[6]
+    Returns:
+        None, or a string (the URL.)
+    """
+    data = apache_log_line_to_dict(line)
+    request_path = data['request_path']
 
     # GET requests only.
-    if not request_verb == 'GET':
+    if not data['request_verb'] == 'GET':
         return None
 
     # successful requests only.
-    if not http_status_code == '200':
+    if data['http_status_code'] not in ALLOWED_HTTP_STATUS_CODES:
         return None
 
     return request_path
 
-# parse a line of CSV data exported from Google Analytics.
-# returns None, or a string (the URL.)
-
 
 def google_analytics_export_line_to_request_path(line):
+    """
+    Parse a line of CSV data exported from Google Analytics.
+
+    Returns:
+        None, or a string (the URL.)
+    """
     request_path = line.split(',')[0]
     try:
         return request_path if request_path[0] == '/' else None
     except IndexError:
         return None
 
-# for a VuFind URL, get the fields we want to export.
-# returns None if fields cannot be found, or a list of fields.
-
 
 def vufind_request_path_to_fields(request_path):
+    """
+    For a VuFind URL, get the fields we want to export.
+
+    Returns:
+        None if fields cannot be found, or a list of fields.
+    """
+
     # basic keyword, advanced keyword, or browse.
     search_type = ''
 
@@ -104,12 +253,11 @@ def vufind_request_path_to_fields(request_path):
         return None
 
     # a dictionary of url parameters
-    parameters = urlparse.parse_qs(urlparse.urlparse(request_path).query)
+    parameters = urllib.parse.parse_qs(
+        urllib.parse.urlparse(request_path).query)
 
     # query string.
-    query_string = ''
-    if '?' in request_path:
-        query_string = request_path.split('?', 1)[1]
+    query_string = get_query_string(request_path)
 
     # collect filters.
     filters = dict.fromkeys(filter_headings, '')
@@ -131,15 +279,17 @@ def vufind_request_path_to_fields(request_path):
         # basic search
         if 'lookfor' in parameters:
             search_type = 'basic keyword'
-            if not 'type' in parameters:
+            if 'type' not in parameters:
                 types['AllFields'] = parameters['lookfor'][0]
             else:
-                for t in types.keys():
+                for t in list(types.keys()):
                     if t == parameters['type'][0]:
                         types[t] = parameters['lookfor'][0]
 
         # advanced search
-        for lookfor_n, type_n in (('lookfor0[]', 'type0[]'), ('lookfor1[]', 'type1[]'), ('lookfor2[]', 'type2[]')):
+        for lookfor_n, type_n in (('lookfor0[]', 'type0[]'),
+                                  ('lookfor1[]', 'type1[]'), ('lookfor2[]',
+                                                              'type2[]')):
             if lookfor_n in parameters and type_n in parameters:
                 search_type = 'advanced keyword'
                 for l, t in zip(parameters[lookfor_n], parameters[type_n]):
@@ -159,19 +309,50 @@ def vufind_request_path_to_fields(request_path):
 
     return fields
 
+
+def update_file_date_hitcount(request_path, line):
+    """
+    Updates a dictionary of counters for files. The dictionary contains a tally
+    of information about how many times a file has been accessed per month,
+    organized by year.
+
+    Returns:
+        None
+    """
+    log_data = apache_log_line_to_dict(line)
+
+    # Throw away seconds if any
+    date = datetime.strptime(log_data['date_and_time'].split(':')[0],
+                             DATE_TIME_FORMAT)
+
+    # Dictionary of years and months with a counter set to 0 for each month
+    date_matrix = OrderedDict(
+        (y, OrderedDict((m, 0) for m in range(1, 13))) for y in LIMIT_TO_YEARS)
+
+    if in_allowed_sections(request_path):
+        if request_path in file_date_hitcount:
+            file_date_hitcount[request_path][date.year][date.month] += 1
+        else:
+            file_date_hitcount[request_path] = deepcopy(date_matrix)
+            file_date_hitcount[request_path][date.year][date.month] += 1
+
+    return None
+
+
 ########
 # MAIN #
 ########
 
-
 # parse command line options.
 parser = OptionParser()
-parser.add_option("-a", "--apache", action="store_true",
-                  dest="apache", default=False)
-parser.add_option("-g", "--google", action="store_true",
-                  dest="google", default=False)
-parser.add_option("-v", "--vufind", action="store_true",
-                  dest="vufind", default=False)
+parser.add_option(
+    "-a", "--apache", action="store_true", dest="apache", default=False)
+parser.add_option(
+    "-g", "--google", action="store_true", dest="google", default=False)
+parser.add_option(
+    "-v", "--vufind", action="store_true", dest="vufind", default=False)
+parser.add_option(
+    "-y", "--years", action="store_true", dest="years", default=False)
 (options, args) = parser.parse_args()
 
 if not options.apache and not options.google:
@@ -179,16 +360,17 @@ if not options.apache and not options.google:
         "You must enter an export type, either --apache or --google.")
     sys.exit()
 
-if not options.vufind:
+if not options.vufind and not options.years:
     sys.stderr.write("You must enter a data type, either --vufind, or...")
     sys.exit()
 
 # write headers.
-csv_writer = csv.writer(sys.stdout, delimiter="\t",
-                        quotechar="\\", quoting=csv.QUOTE_MINIMAL)
-csv_writer.writerow(headers)
+csv_writer = csv.writer(
+    sys.stdout, delimiter="\t", quotechar="\\", quoting=csv.QUOTE_MINIMAL)
+csv_writer.writerow(HEADERS + LIMIT_TO_YEARS)
 
-# loop over input.
+# loop over all input. Write output if necessary or collect
+# data to write later.
 while True:
     line = sys.stdin.readline()
     if line == '':
@@ -201,7 +383,7 @@ while True:
     elif options.google:
         request_path = google_analytics_export_line_to_request_path(line)
 
-    if request_path == None:
+    if request_path is None:
         continue
 
     # get output fields from the request path.
@@ -209,7 +391,30 @@ while True:
     if options.vufind:
         fields = vufind_request_path_to_fields(request_path)
 
-    if fields == None:
+    # update counter if gathering hitcount
+    if options.years:
+        update_file_date_hitcount(request_path, line)
+
+    if fields is None:
         continue
 
-    csv_writer.writerow(fields)
+    # write a row to csv if --vufind
+    if options.vufind:
+        csv_writer.writerow(fields)
+
+# write data to csv if a date count was requested
+if options.years:
+    for fpath in file_date_hitcount:
+        parts = split_filename_from_path(fpath)
+        assert (len(parts) == 2)
+        path, filename = parts
+        fields = [path] + [filename]
+        for year in file_date_hitcount[fpath]:
+            total_hits_for_year = total_hits_to_string(
+                sum([
+                    file_date_hitcount[fpath][year][m]
+                    for m in file_date_hitcount[fpath][year]
+                ]))
+            fields += [total_hits_for_year]
+        assert (len(fields) == len(HEADERS + LIMIT_TO_YEARS))
+        csv_writer.writerow(fields)
