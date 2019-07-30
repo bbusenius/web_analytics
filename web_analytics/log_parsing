@@ -210,6 +210,11 @@ def apache_log_line_to_request_path(line):
     Returns:
         None, or a string (the URL.)
     """
+    # Ignore lines that don't match the regex. Currently, these are
+    # lines that do not have an IP and start with ' -'. There should
+    # be a better way to handle this. TODO
+    if not re.match(REGEX, line):
+        return None
     data = apache_log_line_to_dict(line)
     request_path = data['request_path']
 
